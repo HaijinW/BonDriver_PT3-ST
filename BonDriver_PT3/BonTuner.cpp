@@ -39,6 +39,7 @@ CBonTuner::CBonTuner()
 
 	m_dwCurSpace = 0xFF;
 	m_dwCurChannel = 0xFF;
+	m_hasStream = TRUE ;
 
 	m_iID = -1;
 	m_hStopEvent = _CreateEvent(FALSE, FALSE, NULL);
@@ -167,6 +168,7 @@ void CBonTuner::CloseTuner(void)
 
 	m_dwCurSpace = 0xFF;
 	m_dwCurChannel = 0xFF;
+    m_hasStream = TRUE;
 
 	::CloseHandle(m_hOnStreamEvent);
 	m_hOnStreamEvent = NULL;
@@ -193,7 +195,7 @@ const BOOL CBonTuner::SetChannel(const BYTE bCh)
 
 const float CBonTuner::GetSignalLevel(void)
 {
-	if( m_iID == -1 ){
+	if( m_iID == -1 || !m_hasStream){
 		return 0;
 	}
 	DWORD dwCn100;
@@ -233,7 +235,7 @@ const DWORD CBonTuner::GetReadyCount(void)
 {
 	DWORD dwCount = 0;
 	::EnterCriticalSection(&m_CriticalSection);
-	dwCount = (DWORD)m_TsBuff.size();
+	if(m_hasStream) dwCount = (DWORD)m_TsBuff.size();
 	::LeaveCriticalSection(&m_CriticalSection);
 	return dwCount;
 }
@@ -255,7 +257,7 @@ const BOOL CBonTuner::GetTsStream(BYTE **ppDst, DWORD *pdwSize, DWORD *pdwRemain
 {
 	BOOL bRet;
 	::EnterCriticalSection(&m_CriticalSection);
-	if( m_TsBuff.size() != 0 ){
+	if( m_hasStream && m_TsBuff.size() != 0 ){
 		delete m_LastBuff;
 		m_LastBuff = m_TsBuff.front();
 		m_TsBuff.pop_front();
@@ -326,11 +328,12 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 		return FALSE;
 	}
 
-	if (m_iID == -1) {
-		return FALSE;
-	}
+	m_hasStream=FALSE ;
 
-	if ((SendSetCh(m_iID, itr->second.dwPT1Ch, itr->second.dwTSID)) != CMD_SUCCESS) {
+	DWORD dwRet=CMD_ERR;
+	if( m_iID != -1 ){
+		dwRet=SendSetCh(m_iID, itr->second.dwPT1Ch, itr->second.dwTSID);
+	}else{
 		return FALSE;
 	}
 
@@ -339,9 +342,16 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 
 	PurgeTsStream();
 
-	m_dwCurSpace = dwSpace;
-	m_dwCurChannel = dwChannel;
-	return TRUE;
+	m_hasStream = (dwRet&CMD_BIT_NON_STREAM) ? FALSE : TRUE ;
+	dwRet &= ~CMD_BIT_NON_STREAM ;
+
+	if( dwRet==CMD_SUCCESS ){
+		m_dwCurSpace = dwSpace;
+		m_dwCurChannel = dwChannel;
+		return TRUE;
+	}
+
+	return FALSE;
 }
 
 const DWORD CBonTuner::GetCurSpace(void)
@@ -376,17 +386,23 @@ UINT WINAPI CBonTuner::RecvThread(LPVOID pParam)
 		DWORD dwSize;
 		BYTE *pbBuff;
 		if ((SendSendData(pSys->m_iID, &pbBuff, &dwSize, strEvent, strPipe) == CMD_SUCCESS) && (dwSize != 0)) {
-			TS_DATA *pData = new TS_DATA(pbBuff, dwSize);
-			::EnterCriticalSection(&pSys->m_CriticalSection);
-			while (pSys->m_TsBuff.size() > MAX_BUFF_COUNT) {
-				TS_DATA *p = pSys->m_TsBuff.front();
-				pSys->m_TsBuff.pop_front();
-				delete p;
+			if(pSys->m_hasStream) {
+				TS_DATA *pData = new TS_DATA(pbBuff, dwSize);
+				::EnterCriticalSection(&pSys->m_CriticalSection);
+				while (pSys->m_TsBuff.size() > MAX_BUFF_COUNT) {
+					TS_DATA *p = pSys->m_TsBuff.front();
+					pSys->m_TsBuff.pop_front();
+					delete p;
+				}
+				pSys->m_TsBuff.push_back(pData);
+				::LeaveCriticalSection(&pSys->m_CriticalSection);
+				::SetEvent(pSys->m_hOnStreamEvent);
+			}else {
+				//‹xŽ~
+				delete [] pbBuff ;
 			}
-			pSys->m_TsBuff.push_back(pData);
-			::LeaveCriticalSection(&pSys->m_CriticalSection);
-			::SetEvent(pSys->m_hOnStreamEvent);
 		}else{
+			if(!pSys->m_hasStream) pSys->PurgeTsStream();
 			::Sleep(5);
 		}
 	}
